@@ -1,0 +1,908 @@
+# -*- coding: utf-8 -*-
+
+__Name__ = 'sketchflow'
+__Comment__ = ''
+__Author__ = 'DB'
+__Version__ = '0.5'
+__Date__ = '2020-12-15'
+__License__ = 'LGPL-3.0-or-later'
+__Web__ = ''
+__Wiki__ = 'README.md'
+__Icon__ = ''
+__Help__ = ''
+__Status__ = ''
+__Requires__ = 'FreeCAD >= 0.19' 
+__Communication__ = ''
+__Files__ = ''
+
+VERSION_STRING = __Name__ + ' Macro v' + __Version__
+
+
+import FreeCAD
+import FreeCADGui
+import Part
+import Sketcher
+import re
+import math
+import json
+from PySide import QtGui
+from PySide import QtCore
+import os
+from pathlib import Path
+import sys
+import copy
+import string
+
+# An Objects name uses a naming convention so we can find things. The label can be changed by the user but the name 
+# will stay the same as when it was created. Put the name into label2 so that its visible in the model tree view 
+# under description
+#
+# sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx
+#
+# A zero in a field means its not used for that case. 
+#
+# sfHeader is SF (or something else as defined below)
+# sfType: is one of 'sfGroup', 'sfLinksGrp', 'sfBaseGrp', 'sfBaseSketch', 'sfSketchGrp', 'sfMainSketch', 'sfSketchLnk', 'sfParameters', 'sfAnchors' 
+# sfGrpInst: The top level group gets an instance number, the child objects in that group will have the same groupInstance
+# sketchGrpInst: each sketchGroup gets an instance number, child objects in that group will have the same sketchGroup instance
+#                      anything not in the sketchGroup will have zero in this field
+# objInst: each object that can have multiple instances (ie base sketches and sketch links) will have a unique instance number, everything else will be zero 
+# maxChildIdx: This is only valid in label2 of the top level group. It is an always incrementing value for tat sketchflowgroup whenever an object is 
+#             created for that sketchflowgroup so that we don't cause name clashes and can deal with deletions - well, at least at the object name level...  
+
+SFHEADER = 'SF'
+
+SFTYPE = ['sfGroup', 'sfLinksGrp', 'sfBaseGrp', 'sfBaseSketch', 'sfSketchGrp', 'sfMainSketch', 'sfSketchLnk', 'sfSketchGrpLnk', 'sfParameters', 'sfBinder']
+
+
+def clearRptView():
+    mw=FreeCADGui.getMainWindow()
+    r=mw.findChild(QtGui.QTextEdit, "Report view")
+    r.clear()
+
+def extractNameComponents(nameIn):
+    nameList = nameIn.split('_')
+    if len(nameList) == 6:
+        if nameList[0] == SFHEADER: return nameList
+    return ['','','','','','']
+
+def nameFromList(nameList):
+    nameString = ''.join('%s_' % v for v in nameList).rstrip('_') 
+    return nameString
+
+def sfGroupName(instNum):
+    instNumStr = instNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    return nameFromList([SFHEADER, 'sfGroup', instNumStr, '0', '0', '0'])
+
+def paramName(instNum):
+    instNumStr = instNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    return nameFromList([SFHEADER, 'sfParameters', instNumStr, '0', '0', '0'])   
+
+def anchorSketchName(instNum):
+    instNumStr = instNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    return nameFromList([SFHEADER, 'sfAnchors', instNumStr, '0', '0', '0'])   
+
+def linksName(instNum):
+    instNumStr = instNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    return nameFromList([SFHEADER, 'sfLinksGrp', instNumStr, '0', '0', '0'])
+
+def baseName(instNum):
+    instNumStr = instNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    return nameFromList([SFHEADER, 'sfBaseGrp', instNumStr, '0', '0', '0'])
+
+def sketchGroupName(instNum, sInstNum):
+    instNumStr = instNum
+    sInstNumStr = sInstNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    if type(sInstNum) is int: sInstNumStr = str(sInstNum)
+    return nameFromList([SFHEADER, 'sfSketchGrp', instNumStr, sInstNumStr, '0', '0'])    
+
+def mainSketchName(instNum, sInstNum):
+    instNumStr = instNum
+    sInstNumStr = sInstNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    if type(sInstNum) is int: sInstNumStr = str(sInstNum)
+    return nameFromList([SFHEADER, 'sfMainSketch', instNumStr, sInstNumStr, '0', '0'])      
+
+def baseSketchName(instNum, bsInstNum):
+    instNumStr = instNum
+    bsInstNumStr = bsInstNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    if type(bsInstNum) is int: bsInstNumStr = str(bsInstNum)
+    return nameFromList([SFHEADER, 'sfBaseSketch', instNumStr, '0', bsInstNumStr, '0'])     
+
+def sketchLinkName(instNum, msInstNum, lnInstNum):
+    instNumStr = instNum
+    msInstNumStr = msInstNum
+    lnInstNumStr = lnInstNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    if type(msInstNum) is int: msInstNumStr = str(msInstNum)
+    if type(lnInstNum) is int: lnInstNumStr = str(lnInstNum)
+    #                    sfHeader,     sfType,    sfGrpInst, sketchGrpInst, objInst,     maxChildIdx
+    return nameFromList([SFHEADER, 'sfSketchLnk', instNumStr, msInstNumStr, lnInstNumStr, '0'])   
+
+def sketchGroupLinkName(instNum, lnInstNum):
+    instNumStr = instNum
+    lnInstNumStr = lnInstNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    if type(lnInstNum) is int: lnInstNumStr = str(lnInstNum)
+    #                    sfHeader,     sfType,    sfGrpInst, sketchGrpInst, objInst,     maxChildIdx
+    return nameFromList([SFHEADER, 'sfSketchGrpLnk', instNumStr, '0', lnInstNumStr, '0'])      
+
+def binderName(instNum, lnInstNum):
+    instNumStr = instNum
+    lnInstNumStr = lnInstNum
+    if type(instNum) is int: instNumStr = str(instNum)
+    if type(lnInstNum) is int: lnInstNumStr = str(lnInstNum)
+    #                    sfHeader,     sfType,    sfGrpInst, sketchGrpInst, objInst,     maxChildIdx
+    return nameFromList([SFHEADER, 'sfBinder', instNumStr, '0', lnInstNumStr, '0'])  
+
+def getNextChildInst(sfGrpInst):
+    doc = FreeCAD.ActiveDocument
+    maxChildIdxInt = 0
+    sfGrpInstStr = sfGrpInst
+    if type(sfGrpInst) is int: sfGrpInstStr = str(sfGrpInst)    
+
+    sfGroupNameStr = sfGroupName(sfGrpInstStr)
+    sfGroup = doc.getObject(sfGroupNameStr)
+    sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = extractNameComponents(sfGroup.Label2)
+    maxChildIdxInt = int(maxChildIdx) + 1
+    maxChildIdx = str(maxChildIdxInt)
+    sfGroupLabel2 = nameFromList([SFHEADER, 'sfGroup',sfGrpInstStr, '0', '0', maxChildIdx])
+    sfGroup.Label2 = sfGroupLabel2
+
+    return maxChildIdx
+
+def findExistingSketchFlowGroupsInDoc():
+    # finds any existing toplevel sketchflow groups in the active document, returns a list of grpInst numbers if any are found
+    # otherwise returns an empty list. 
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+    sfGroups = []
+    for o in objects:
+        sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = extractNameComponents(o.Name) 
+        if (sfHeader == SFHEADER) and (sfType == 'sfGroup'): sfGroups.append(int(sfGrpInst))
+    return sfGroups
+
+def createStructure():
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+    sfGrpInst = 1
+
+    existingSfGrpInstList = findExistingSketchFlowGroupsInDoc()
+    if len(existingSfGrpInstList) > 0: sfGrpInst = str(max(existingSfGrpInstList) + 1)
+
+    sketchflowgroupName =sfGroupName(sfGrpInst)
+    sketchflowgroup = doc.addObject('App::DocumentObjectGroup', sketchflowgroupName)
+    sketchflowgroup.Label2 = sketchflowgroupName
+    sketchflowgroup.Label = 'Sketchflow '    
+
+    paramNameStr = paramName(sfGrpInst)
+    paramSketch = doc.addObject('Sketcher::SketchObject', paramNameStr)
+    paramSketch.Placement = FreeCAD.Placement(FreeCAD.Vector(0.000000, 0.000000, 0.000000), FreeCAD.Rotation(0.000000, 0.000000, 0.000000, 1.000000))
+    paramSketch.MapMode = "Deactivated"
+    sketchflowgroup.addObject(paramSketch)    
+    paramSketch.Label = "Parameters "
+    paramSketch.Label2 = paramNameStr      
+
+    linksgroupName = linksName(sfGrpInst)
+    linksgroup = doc.addObject('App::DocumentObjectGroup', linksgroupName)
+    sketchflowgroup.addObject(linksgroup)
+    linksgroup.Label2 = linksgroupName
+    linksgroup.Label = 'Links '    
+
+    basegroupName = baseName(sfGrpInst)
+    basegroup = doc.addObject('App::DocumentObjectGroup', basegroupName)
+    sketchflowgroup.addObject(basegroup)
+    basegroup.Label2 = basegroupName
+    basegroup.Label = 'Base '  
+
+
+def newSketchGroup():
+    sel = FreeCADGui.Selection.getSelection()
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+    sfGroup = None
+    sfGroupNameStr = sfGroupName(1)
+    sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = ['', '', '', '', '', '']
+    sketchGrpInstance = 0
+
+    if len(sel) == 0:
+        print ('No selection, checking if there is a single SF group we can use')
+        sfGroups = findExistingSketchFlowGroupsInDoc()
+        if len(sfGroups) == 0:
+            print ("No sketchflow groups.... create a sketchflow group first")
+            return
+        elif len(sfGroups) > 1:
+            print ("More than one sketchflow group, select the sketchflow group to use")
+            return                
+        else:
+            sfGroup = doc.getObject(sfGroupName(sfGroups[0]))
+            sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = extractNameComponents(sfGroup.Name)
+    else: 
+        sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = extractNameComponents(sel[0].Name) 
+        if (sfHeader == SFHEADER): 
+            sfGroup = doc.getObject(sfGroupName(sfGrpInst))
+        else: 
+            print ("Select a sketchflow group")
+            return
+
+    sketchGrpIndex = getNextChildInst(sfGrpInst)
+    sketchGroupNameStr = sketchGroupName(sfGrpInst, sketchGrpIndex)
+    newSketchGrp = doc.addObject('App::DocumentObjectGroup', sketchGroupNameStr)
+    newSketchGrp.Label = 'Sketchgroup '
+    newSketchGrp.Label2 =  sketchGroupNameStr
+    sfGroup.addObject(newSketchGrp)
+
+    mainSketchNameStr = mainSketchName(sfGrpInst, sketchGrpIndex)
+    mainSketch = doc.addObject('Sketcher::SketchObject', mainSketchNameStr)
+    mainSketch.Placement = FreeCAD.Placement(FreeCAD.Vector(0.000000, 0.000000, 0.000000), FreeCAD.Rotation(0.000000, 0.000000, 0.000000, 1.000000))
+    mainSketch.MapMode = "Deactivated"
+    mainSketch.Label = "Main "
+    mainSketch.Label2 = mainSketchNameStr    
+    newSketchGrp.addObject(mainSketch)
+    if mainSketch.Name != mainSketchNameStr:
+        print ('There is an existing main sketch with the same name - you can copy it here now, or create a new sketch group and deleting this one')
+        doc.removeObject(mainSketch.Name)
+        doc.recompute()
+
+def newBaseSketch():
+    sel = FreeCADGui.Selection.getSelection()
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+    baseGrp = None
+    sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = ['', '', '', '', '', '']
+    baseSketchInstance = 0
+
+    if len(sel) == 0:
+        print ('No selection, checking if there is a single SF group we can use')
+        sfGroups = findExistingSketchFlowGroupsInDoc()
+        if len(sfGroups) == 0:
+            print ("No sketchflow groups.... create a sketchflow group first")
+            return
+        elif len(sfGroups) > 1:
+            print ("More than one sketchflow group, select the sketchflow group to use")
+            return                
+        else:
+            baseGrp = doc.getObject(baseName(sfGroups[0]))
+            sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = extractNameComponents(baseGrp.Name)
+    else: 
+        sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = extractNameComponents(sel[0].Name) 
+        baseGrp = doc.getObject(baseName(sfGrpInst))
+        if baseGrp is None: 
+            print ("Need to select a sketchflow base group")
+            return
+
+    # reason for loop: if you copy out a base sketch it will retain the Name, if you have it into the sketchflow or in the document
+    # in order to put it into a new sketchflow document then you get a name collision and freecad will invent a different name than
+    # the one we picked. This loop detects that case and if a name collision occurs, deletes the sketch and tries again. 
+    nameIsUnique = False
+    for i in range(1, 100, 1):       
+        baseSketchInstance = getNextChildInst(sfGrpInst)
+        baseSketchNameStr = baseSketchName(sfGrpInst, baseSketchInstance)
+
+        baseSketch = doc.addObject('Sketcher::SketchObject', baseSketchNameStr)
+        baseSketch.Placement = FreeCAD.Placement(FreeCAD.Vector(0.000000, 0.000000, 0.000000), FreeCAD.Rotation(0.000000, 0.000000, 0.000000, 1.000000))
+        baseSketch.MapMode = "Deactivated"
+        baseSketch.Label = "Base Sketch "
+        baseSketch.Label2 = baseSketchNameStr    
+        if baseSketch.Name == baseSketchNameStr:
+            baseGrp.addObject(baseSketch)
+            nameIsUnique = True
+            break
+        else:
+            print ('There is an existing object with a base sketch Name - trying next Name')
+            doc.removeObject(baseSketch.Name)
+            doc.recompute()
+   
+    if not nameIsUnique: print ('There are a lot of existing objects with base sketch Names, failed to create a unique name')
+
+def createAnchorsInMain(mainSketch, baseSketch):
+    # copy out existing geo and constraints. Check for any anchors belonging to an old instance and delete them
+    # add in the anchors for the base sketch instance, then add back the existing geo and constraints. 
+
+    anchorPostfix = '_' + baseSketch.Label2
+    numAnchors = findMaxAnchorsNumInSketch(baseSketch)
+
+    existingGeo = []
+    existingCon = []
+    existingExp = []
+    for geo in mainSketch.Geometry: existingGeo.append(geo)
+    print (len(mainSketch.Constraints))
+    for i, con in enumerate(mainSketch.Constraints):
+        existingCon.append(con)
+
+    # delete the constraints - start with highest constraints instead of geo so we dont cause re-ordering 
+    for i, con in reversed(list(enumerate(mainSketch.Constraints))):
+        mainSketch.delConstraint(i)
+
+    # delete all existing geometry 
+    for i, geo in reversed(list(enumerate(mainSketch.Geometry))): 
+        mainSketch.delGeometry(i)    
+
+    # add in the new anchors
+    radius = 5.0
+    for i in range(numAnchors):
+        xloc = baseSketch.Geometry[i].Center.x
+        yloc = baseSketch.Geometry[i].Center.y        
+        mainSketch.addGeometry(Part.Circle(FreeCAD.Vector(xloc,yloc,0),FreeCAD.Vector(0,0,1),radius),True)
+        mainSketch.addConstraint(Sketcher.Constraint('Radius',i,radius)) 
+        mainSketch.renameConstraint(i, 'anchor_' + str(i+1) + anchorPostfix)    
+        mainSketch.setVirtualSpace(i, True)
+        radius = 2.5
+
+    # add back the existing geo, adjust for additional geo from the anchors. 
+    # add back the existing geometry 
+    for geo in existingGeo:
+        mainSketch.addGeometry(geo, geo.Construction)   
+    
+    # add back existing anchor constraints we keep the anchor radius constraint and geo a 1:1 index. 
+    addedConstraintCount = 0
+    for con in existingCon:
+        if 'anchor_' in con.Name:
+            if con.First  >= 0: con.First  = con.First  + numAnchors 
+            if con.Second >= 0: con.Second = con.Second + numAnchors 
+            if con.Third  >= 0: con.Third  = con.Third  + numAnchors  
+            mainSketch.addConstraint(con)
+            addedConstraintCount = addedConstraintCount + 1
+
+    # add in the locating constraints for the anchors. On the first loop its the first anchor which we reference to the origin
+    # with non-driving constraints (use this later to update the sketch x,y position) the rest of the anchors are then referenced to the 
+    # first anchor with driving constraints. 
+    second = -1 # this is the origin 
+    secondPos = 1
+    for i in range(numAnchors):
+        print ('anchor index ' + str(i))
+        xloc = baseSketch.Geometry[i].Center.x
+        yloc = baseSketch.Geometry[i].Center.y  
+        mainSketch.addConstraint(Sketcher.Constraint('DistanceX',  second, secondPos, i, 3, xloc))
+        mainSketch.addConstraint(Sketcher.Constraint('DistanceY', second, secondPos, i, 3, yloc)) 
+        currentConstraintIndex = numAnchors + addedConstraintCount + (2*i)        
+        mainSketch.renameConstraint(currentConstraintIndex, 'anchorlocx_' + str(i+1) + anchorPostfix) 
+        mainSketch.renameConstraint(currentConstraintIndex + 1, 'anchorlocy_' + str(i+1) + anchorPostfix)
+        mainSketch.setVirtualSpace(currentConstraintIndex, True)
+        mainSketch.setVirtualSpace(currentConstraintIndex + 1, True)
+        if second == -1: 
+            mainSketch.toggleDriving(currentConstraintIndex)
+            mainSketch.toggleDriving(currentConstraintIndex + 1)
+            second = 0 # this is the first anchor
+            secondPos = 3         
+        
+    # add back the remaining constraints    
+    for con in existingCon:
+        if 'anchor_' not in con.Name:
+            if con.First  >= 0: con.First  = con.First  + numAnchors 
+            if con.Second >= 0: con.Second = con.Second + numAnchors 
+            if con.Third  >= 0: con.Third  = con.Third  + numAnchors  
+            mainSketch.addConstraint(con)            
+
+def setMainSketchAnchorlocxyExpressions(mainSketch, sketchLink):
+    # linking to the link of the base sketch doesn't work because freecad identifies it as a circular reference
+    # so link back to the base sketch. 
+    # naming convention for anchorlocx and anchorlocy when then appear in Main sketch:
+    # header_num_baseSketchLink
+    # header is either anchorlocx or anchorlocy
+    # num is the anchor number in the sketch, 1 is the origin so shouldn't exist. 
+    # base sketch link is the name of the base sketch link - you need to follow the LinkedObject to find the base sketch.
+
+    baseSketch = sketchLink.LinkedObject
+    print (baseSketch.Name)
+    for con in mainSketch.Constraints:
+        if ('anchorlocx_' in con.Name) or ('anchorlocy_' in con.Name):
+            if sketchLink.Name in con.Name:
+                anchorType = con.Name.split('_')[0]
+                anchorNum = con.Name.split('_')[1] 
+                if anchorNum != '1':
+                    exp =  baseSketch.Name + '.Constraints.' + anchorType + '_' + anchorNum 
+                    mainAnchorRef = '.Constraints.' + anchorType + '_' + anchorNum + '_' + sketchLink.Name 
+                    mainSketch.setExpression(mainAnchorRef, exp)
+
+
+def createInstance():
+    sel = FreeCADGui.Selection.getSelection()
+    doc = FreeCAD.ActiveDocument
+
+    sourceBaseSketch = []
+    destSketchGroup = []
+    destSketchGrpInstIndex = 0
+    sfGroupInstIndex = 0
+
+    if len(sel) != 2:
+        print ('Select only 1 source base sketch and one destination sketch group')
+        return      
+    
+    # check that the correct types have been selected and if they have, untangle the selection order if needed.
+    sfHeader0, sfType0, sfGrpInst0, sketchGrpInst0, objInst0, maxChildIdx0 = extractNameComponents(sel[0].Name) 
+    sfHeader1, sfType1, sfGrpInst1, sketchGrpInst1, objInst1, maxChildIdx1 = extractNameComponents(sel[1].Name)    
+    if (sfType0 == 'sfBaseSketch') and (sfType1 == 'sfSketchGrp'):
+        sourceBaseSketch = sel[0]
+        destSketchGroup = sel[1]
+        destSketchGrpInstIndex = sketchGrpInst1
+        sfGroupInstIndex = sfGrpInst1
+    elif (sfType0 == 'sfSketchGrp') and s(fType1 == 'sfBaseSketch'):
+            sourceBaseSketch = sel[1]
+            destSketchGroup = sel[0]
+            destSketchGrpInstIndex = sketchGrpInst0
+            sfGroupInstIndex = sfGrpInst0
+    else:
+        print ('Need to select a baseSketch and a sketchgroup')  
+        return            
+
+    if sfGrpInst0 != sfGrpInst1:
+        print ('The source base sketch and destination sketchgroup are in different sketchflow groups that might not a good idea.... but if you know what your doing....')
+
+    sketchLinkInstance = getNextChildInst(sfGroupInstIndex)
+    sketchLinkNameStr = sketchLinkName(sfGroupInstIndex, destSketchGrpInstIndex, sketchLinkInstance)
+    sketchLink = doc.addObject('App::Link', sketchLinkNameStr)
+    sketchLink.setLink(sourceBaseSketch)
+    destSketchGroup.addObject(sketchLink)    
+
+    exp = sourceBaseSketch.Name + '.Label'  
+    sketchLink.setExpression('Label', exp)
+    sketchLink.Label2 = sketchLinkNameStr
+    doc.recompute() # make the expression take effect
+    
+    mainSketchNameStr = mainSketchName(sfGroupInstIndex, destSketchGrpInstIndex)
+    mainSketch = doc.getObject(mainSketchNameStr)
+    createAnchorsInMain(mainSketch, sketchLink)
+    setPositionOfBaseSketchInstance(mainSketch, sketchLink)
+    setMainSketchAnchorlocxyExpressions(mainSketch, sketchLink)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def copy_object(target_document, obj, with_dependencies=False):
+    previous_existing_objects = frozenset(target_document.Objects)
+    target_document.copyObject(obj, with_dependencies)
+    # find root of copied objects (copyObject() seems to return the last element added in target_document)
+    for o in target_document.TopologicalSortedObjects:
+        if not o in previous_existing_objects:  # parent object is before all of its children -> new root tested first
+            return o
+    raise ValueError("Root of copied object not found")    
+
+def checkSelection():
+    """
+    Uses the GUI selection and checks if two sketches have been selected. 
+    One sketch from base_sketches and a sketch outside of base_sketches.
+    
+    Returns:
+    [] if no sketches or an invalid sketch selection has been made.
+    [<Sketcher::SketchObject>, <Sketcher::SketchObject>] if a valid selection of sketches has been made
+    the first sketch is the source sketch (from base_sketches) the second is the destination irrespective of the 
+    order in which they were actually selected. 
+    """
+    sel = FreeCADGui.Selection.getSelection()
+    if len(sel) != 2:
+        print ("need to select 2 sketches, a source sketch and destination sketch")
+        return []
+    for s in sel:
+        if "Sketcher::SketchObject" not in s.TypeId:
+            print ("Select only sketches.")
+            return []
+
+    base_sketches = getBaseSketchList()
+    
+    # check if one (and only one) sketch is in base_sketches - only need to check two entries
+    # because different numbers have already been addressed. 
+    selected_base_sketch = []
+    for bs in base_sketches:
+        if sel[0] == bs: selected_base_sketch.append(bs)
+        if sel[1] == bs: 
+            selected_base_sketch.append(bs)
+            print ("reversing the order")
+            sel.reverse()
+    if len(selected_base_sketch) != 1:
+        print ("Need to select one (and only one) source sketch from base_sketches")
+        return []
+
+    # if we get to here then sel should be ok
+    return sel
+
+
+def newSketchFromSelectedBaseSketch(instanceNum):
+    """
+    uses the selection to copy a sketch to the selected group and update the name to the naming convention.
+    selection[0] is the base sketch selection[1] is the group to put the copy of the base sketch
+    original base sketch name -> base_wordsAboutTheSketch
+    Name in the selected group -> groupName_wordsAboutTheSketch
+    
+    Returns:
+    [<SketchObject>] the new sketch which is a copy of the selected base sketch located in the selected group
+    """
+    sc = copy_object(FreeCAD.ActiveDocument, FreeCADGui.Selection.getSelection()[0])
+    FreeCADGui.Selection.getSelection()[1].addObject(sc)
+    baseSketchLabel = FreeCADGui.Selection.getSelection()[0].Label
+    groupLabel = FreeCADGui.Selection.getSelection()[1].Label
+    sc.Label = groupLabel + "_" + baseSketchLabel.replace('base_', '') + "_" + str(instanceNum)
+    return sc
+
+def findMaxAnchorsNumInSketch(sketch):
+    maxAnchorNum = 0
+    for con in sketch.Constraints:
+        if ('anchor' in con.Name) and ('_loc_' not in con.Name):
+            maxAnchorNum = int(con.Name.split("_")[1]) 
+    return maxAnchorNum   
+
+def findNextInstanceNumInGroup(baseSketch, group):
+    contentsOfGroup = group.OutList
+    baseSketchLabel = baseSketch.Label.split("_")[1]
+    maxInstance = 0
+    for s in contentsOfGroup:
+        instanceSketchLabel = s.Label.split("_")
+        if baseSketchLabel in instanceSketchLabel[1]:
+            if int(instanceSketchLabel[2]) > maxInstance:
+                maxInstance = int(instanceSketchLabel[2])
+
+    return maxInstance + 1
+
+
+
+
+def setPositionOfBaseSketchInstance(mainSketch, baseSketchInst):
+    
+    # create the linking expression and insert into sketch placement
+    baseSketchCoreLabel = baseSketchInst.Name
+    xlocExpression = mainSketch.Name + ".Constraints.anchorlocx_1_" + baseSketchCoreLabel
+    ylocExpression = mainSketch.Name + ".Constraints.anchorlocy_1_" + baseSketchCoreLabel
+  
+    baseSketchInst.setExpression('.Placement.Base.x', xlocExpression)
+    baseSketchInst.setExpression('.Placement.Base.y', ylocExpression)
+
+class DocObserver():
+	def slotCreatedDocument(self,doc):
+		print ("Create document")
+	def slotDeletedDocument(self,doc):
+		self.cancelObservation(obs)
+		print ("Delete document")
+	def slotChangedObject(self,doc,obj):
+		print("you have changed an object!")
+	def slotRecomputedObject(self,doc):
+		print("recomputation triggered")
+	def slotCreatedObject(self,doc):
+		print("A new object was added")
+	def cancelObservation(self,obs):
+		App.removeDocumentObserver(obs)		
+		print("observation cancelled")
+
+# function to detect work bench change
+def wbChange(name):
+    print ("Activated workbench: {}".format(name))
+
+    # set up document observer
+    #obs=DocObserver()
+    #App.removeDocumentObserver(obs)
+    #App.addDocumentObserver(obs)
+
+    
+    # initiate a new doc
+    #doc = FreeCAD.newDocument()
+    #mw=Gui.getMainWindow()
+    #mw.workbenchActivated.connect(wbChange)
+    
+    # Do something:
+    #Volume = doc.addObject("Part::Sphere", "TreatmentVolume")
+    # recompute:
+    #doc.recompute()
+    #Gui.SendMsgToActiveView("ViewFit")
+    #Gui.activateWorkbench("PartWorkbench")
+    # now play with the object size etc, and note the resultant messages in the Report View
+
+
+sketchGroupPrefix = 'SF'
+
+def getUniqueName(typeId, desiredLab, checkElements = []):
+
+    # checkElements, empty list means check whole string
+    # [0,1,2] means split a string on '_' character and then check the first, second and third elemement 
+    
+    newLab = desiredLab
+
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+    alreadyExists = False
+    existingLabels = []
+    # filter out any label belonging to types we aren't interested in and also filter off 
+    # parts of the label we aren't interested in.  
+    for o in objects:
+        if typeId in o.TypeId:
+            if len(checkElements) == 0: existingLabels.append(o.Label)
+            else:
+                subLabel = ''
+                for i, element in enumerate(o.Label.split("_")):
+                    if i in checkElements: 
+                        if subLabel == '': subLabel = element
+                        else: subLabel = subLabel + '_' + element  
+                existingLabels.append(subLabel)
+
+    # check if the label we want is unique within the filtered list of labels just found
+    # and if it isn't create a unique name
+    for i in range(1, 100, 1):
+        for lab in existingLabels:
+            if newLab == lab:
+                alreadyExists = True
+                break 
+        if not alreadyExists: break
+        newLab = desiredLab.rstrip(string.digits) + str(i+1)
+        alreadyExists = False
+    
+    return newLab
+
+def getUniqueInstNum():
+    instmax = 0
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+    for o in objects:
+        if 'App::Link' in o.TypeId:
+            if 'base_link' in o.Label2:
+                lab = o.Label2.split('_')
+                if int(lab[-1]) > instmax:
+                    instmax = int(lab[-1])
+    return instmax + 1
+
+def getInstLabelFromAnchorName(anchorName):
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+    baseLinkList = anchorName.split('_')
+    baseLinkLabel = baseLinkList[2] + ('_') + baseLinkList[3] + ('_') + baseLinkList[4] + ('_') + baseLinkList[5]    
+    for o in objects:
+        if 'App::Link' in o.TypeId:
+            if baseLinkLabel in o.Label2:
+                return o.Label
+    return ''
+
+def getUniqueIndex(desiredName):
+    doc = FreeCAD.ActiveDocument
+    objects = doc.Objects
+
+    for o in objects:
+        print ('Label: ' + o.Label)
+        print ('Name: ' + o.Name)
+    
+
+
+
+#def createStructure():
+#    doc = FreeCAD.ActiveDocument
+#    objects = doc.Objects
+#    origSketchesGroupLabel = sketchGroupPrefix 
+#    newSketchesGroupLabel = origSketchesGroupLabel
+#
+#    # sel should now be a valid Sketches group
+#    sketchesGroupLabel = getUniqueName('App::DocumentObjectGroup', origSketchesGroupLabel, [0])
+#   
+#    sketches = doc.addObject('App::DocumentObjectGroup', sketchesGroupLabel + '_sketchesGrpDescription')
+#    spreadsheet = doc.addObject('Spreadsheet::Sheet', sketchesGroupLabel.lower() + '_Spreadsheet')
+#    sketches.addObject(spreadsheet)    
+#    links = doc.addObject('App::DocumentObjectGroup', sketchesGroupLabel.lower() + '_links')
+#    sketches.addObject(links)
+#    base = doc.addObject('App::DocumentObjectGroup', sketchesGroupLabel.lower() + '_base')
+#    sketches.addObject(base)
+
+
+
+
+#def newSketchGroup():
+#    sel = FreeCADGui.Selection.getSelection()
+#    doc = FreeCAD.ActiveDocument
+#    objects = doc.Objects
+#    origSketchesGroupLabel = sketchGroupPrefix 
+#
+#    sketchesGrp = []
+#    if len(sel) == 0:
+#        print ('No selection, check if there is a default SF group')
+#        for o in objects:
+#            if 'App::DocumentObjectGroup' in o.TypeId:
+#                if origSketchesGroupLabel == o.Label.split('_')[0]:
+#                    sketchesGrp = FreeCAD.ActiveDocument.getObjectsByLabel(o.Label)
+#                    break
+#        if len(sketchesGrp) == 0: 
+#            print ("No default Sketches group.... create the structure or select a Sketch group")
+#            return
+#        else: sel = sketchesGrp[0] 
+#    else: 
+#        sel = sel[0]
+#        if 'App::DocumentObjectGroup' not in sel.TypeId: 
+#            print ("Select a group")
+#            return
+#        if origSketchesGroupLabel not in sel.Label.split('_')[0].rstrip(string.digits):
+#            print ("Select a group labeled SF")
+#            return
+#
+#    # sel should now be a valid Sketches group
+#    lab = getUniqueName('App::DocumentObjectGroup', sel.Label.split('_')[0].lower() + '_s1', [0,1])
+#    newSketchGrp = doc.addObject('App::DocumentObjectGroup', lab)
+#    newSketchGrp.Label = newSketchGrp.Label + '_editThisSketchGroupDescription'
+#    newSketchGrp.Label2 =  sel.Label.split('_')[0].lower() + '_sketch_group'
+#
+#    sel.addObject(newSketchGrp)
+#
+#    mainSketch = doc.addObject('Sketcher::SketchObject', lab + '_main')
+#    mainSketch.Placement = FreeCAD.Placement(FreeCAD.Vector(0.000000, 0.000000, 0.000000), FreeCAD.Rotation(0.000000, 0.000000, 0.000000, 1.000000))
+#    mainSketch.MapMode = "Deactivated"
+#    newSketchGrp.addObject(mainSketch)
+
+
+
+#def newBaseSketch():
+#    sel = FreeCADGui.Selection.getSelection()
+#    doc = FreeCAD.ActiveDocument
+#    objects = doc.Objects
+#    origSketchesGroupLabel = sketchGroupPrefix 
+#
+#    sketchesGrp = []
+#    if len(sel) == 0:
+#        print ('No selection, check if there is a base group')
+#        for o in objects:
+#            if 'App::DocumentObjectGroup' in o.TypeId:
+#                if origSketchesGroupLabel == o.Label.split('_')[0]:
+#                    sketchesGrp = FreeCAD.ActiveDocument.getObjectsByLabel(o.Label)
+#                    break
+#        if len(sketchesGrp) == 0: 
+#            print ("No default SF group found.... create the structure or select a base group")
+#            return
+#        else: sel = sketchesGrp[0] 
+#    else: 
+#        sel = sel[0]
+#        if 'App::DocumentObjectGroup' not in sel.TypeId: 
+#            print ("Select a group")
+#            return
+#        if origSketchesGroupLabel not in sel.Label.split('_')[0].rstrip(string.digits).upper():
+#            print ("Select a the sketch group or _base group")
+#            return
+#
+#    # sel should now be either the top sketch group or the base group
+#    prefix = sel.Label.split('_')[0].lower()
+#    baseGroup =  FreeCAD.ActiveDocument.getObjectsByLabel(prefix + '_base')[0]
+#    lab = getUniqueName('Sketcher::SketchObject', prefix + '_editBaseSketchLabel')
+#
+#    baseSketch = doc.addObject('Sketcher::SketchObject', lab)
+#    baseSketch.Label2 = prefix + '_base_sketch' 
+#    baseSketch.Placement = FreeCAD.Placement(FreeCAD.Vector(0.000000, 0.000000, 0.000000), FreeCAD.Rotation(0.000000, 0.000000, 0.000000, 1.000000))
+#    baseSketch.MapMode = "Deactivated"
+#    baseGroup.addObject(baseSketch)
+
+def promoteBaseSketchPubParameters():
+    # with the selected sketch, for constraints labeled pub_ add them to the Parameters sketch as a property 
+    # and replace the constraint with an expression that links to the property. 
+
+    sel = FreeCADGui.Selection.getSelection()
+    doc = FreeCAD.ActiveDocument
+    
+    if len(sel) == 0:
+        print  ('You need to select a base sketch to promote the pub_ base sketch constraints to being parameters of the sketchflow group')
+        return
+
+    sfHeader, sfType, sfGrpInst, sketchGrpInst, objInst, maxChildIdx = extractNameComponents(sel[0].Name)
+    if not ((sfHeader == SFHEADER) and (sfType == 'sfBaseSketch')):
+        print ('You need to select a base sketch to promote the pub_ base sketch constraints to being parameters of the sketchflow group')
+        return
+
+    baseSketch = sel[0]
+    parameterSketchNameStr = paramName(sfGrpInst)
+    parameterSketch = doc.getObject(parameterSketchNameStr)
+
+    for i, con in enumerate(baseSketch.Constraints):
+        existingName = con.Name
+        if 'pub_' in existingName:
+            if not hasattr(parameterSketch, existingName):
+                if 'Angle' in con.Type:
+                    parameterSketch.addProperty('App::PropertyAngle', existingName, 'pub')    
+                    setattr(parameterSketch, existingName, con.Value * 180/3.14159265) # convert radians to degrees
+                else:
+                    parameterSketch.addProperty('App::PropertyDistance', existingName, 'pub')    
+                    setattr(parameterSketch, existingName, con.Value)
+
+            exp = parameterSketch.Name + '.' + existingName  
+            baseSketch.setExpression('.Constraints.' + existingName, exp)
+
+
+def createShapebinder():
+    sel = FreeCADGui.Selection.getSelection()
+    doc = FreeCAD.ActiveDocument
+
+    sourceSketchGroup = None
+    destBody = None
+    linkGroup = None
+    sfGroupInstIndex = 0
+
+    if len(sel) != 2:
+        print ('Select 1 source sketchgroup and one destination body')
+        return      
+    
+    # check that the correct types have been selected and if they have, untangle the selection order if needed.
+    sfHeader0, sfType0, sfGrpInst0, sketchGrpInst0, objInst0, maxChildIdx0 = extractNameComponents(sel[0].Name) 
+    sfHeader1, sfType1, sfGrpInst1, sketchGrpInst1, objInst1, maxChildIdx1 = extractNameComponents(sel[1].Name)    
+    if ((sfType0 == 'sfSketchGrp') or (sfType0 == 'sfMainSketch')):
+        if 'PartDesign::Body' in sel[1].TypeId:
+            linkGroup = doc.getObject(linksName(sfGrpInst0)) 
+            sourceSketchGroup = doc.getObject(sketchGroupName(sfGrpInst0, sketchGrpInst0)) 
+            destBody = sel[1]
+            sfGroupInstIndex = sfGrpInst0
+        else:
+            print ('Select 1 source sketchgroup and one destination body') 
+            return
+
+    elif ((sfType1 == 'sfSketchGrp') or (sfType1 == 'sfMainSketch')):
+        if 'PartDesign::Body' in sel[0].TypeId:
+            linkGroup = doc.getObject(linksName(sfGrpInst1)) 
+            sourceSketchGroup = doc.getObject(sketchGroupName(sfGrpInst1, sketchGrpInst1)) 
+            destBody = sel[0]
+            sfGroupInstIndex = sfGrpInst1
+        else:
+            print ('Select 1 source sketchgroup and one destination body') 
+            return           
+    else:
+        print ('Select 1 source sketchgroup and one destination body') 
+        return    
+
+    sketchGroupLnkIndex = getNextChildInst(sfGroupInstIndex)
+    sketchGroupLnkStr = sketchGroupLinkName(sfGroupInstIndex, sketchGroupLnkIndex)
+    sketchGroupLnk = doc.addObject('App::Link', sketchGroupLnkStr)
+    sketchGroupLnk.setLink(sourceSketchGroup)
+    linkGroup.addObject(sketchGroupLnk)   
+    exp = sourceSketchGroup.Name + '.Label' 
+    sketchGroupLnk.setExpression('Label', exp)
+    sketchGroupLnk.Label2 = sketchGroupLnkStr
+    sketchGroupLnk.Visibility = False
+
+    binderIndex = getNextChildInst(sfGroupInstIndex)
+    binderNameStr = binderName(sfGroupInstIndex, binderIndex)
+    binder = destBody.newObject('PartDesign::SubShapeBinder', binderNameStr)    
+    binder.Support = sketchGroupLnk
+    exp = sourceSketchGroup.Name + '.Label' 
+    binder.setExpression('Label', exp)
+    binder.Label2 = binderNameStr
+    FreeCADGui.ActiveDocument.getObject(binderNameStr).DisplayMode = u"Wireframe"
+
+
+def piggle():
+    print ("pigglator3")
+    sel = FreeCADGui.Selection.getSelection()
+    print (sel)
+    if len(sel)>0:
+        print(sel[0].Name)
+
+
+
+if __name__ == '__main__':
+    print (VERSION_STRING)
+    clearRptView()
+    createSketchesStructure(FreeCAD.ActiveDocument)
+
+    #selBaseSketch = FreeCADGui.Selection.getSelection()[0]
+    #selDestGroup = FreeCADGui.Selection.getSelection()[1]
+    #mainSketch = FreeCAD.ActiveDocument.getObjectsByLabel(selDestGroup.Label + "_main")[0]
+    #
+    #instanceNum = findNextInstanceNumInGroup(selBaseSketch, selDestGroup)
+    #newSketchInst = newSketchFromSelectedBaseSketch(instanceNum)
+    #maxAnchorNum = findMaxAnchorsNumInSketch(newSketchInst)
+    #newSketchInstLabelList = newSketchInst.Label.split("_")
+    #anchorPostfix = "_" + newSketchInstLabelList[1] + "_" + newSketchInstLabelList[2] 
+    #createAnchorsInMain(maxAnchorNum, anchorPostfix, mainSketch, selBaseSketch)
+    #setPositionOfBaseSketchInstance(mainSketch, newSketchInst)
+
